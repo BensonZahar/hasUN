@@ -1,0 +1,26 @@
+name: build-version-dll
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build version.dll
+        shell: cmd
+        working-directory: Native
+        run: cl /nologo /utf-8 /LD /O2 /MT /W3 version_proxy.c /Fe:version.dll /link /MACHINE:X64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: version-dll
+          path: Native/version.dll
+          if-no-files-found: error
