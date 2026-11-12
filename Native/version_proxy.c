@@ -10,6 +10,10 @@
  * Любое другое сообщение уходит как обычно.
  *
  * Состояние хука пишется в %TEMP%\airbreak_hook.log (мод AirBreak перепечатает его в UE4SS.log).
+ *
+ * Аргументы запуска: до старта движка подменяем GetCommandLineW в таблице импорта exe и дописываем
+ * в конец командной строки аргументы (по умолчанию -FeatureLevelES31 и т.д.). Список можно поменять
+ * файлом hassle_args.txt рядом с exe (одна строка = один аргумент или пара «-ключ значение»).
  * Сборка: Native\build.bat (нужен Visual Studio Build Tools, x64).
  */
 #define WIN32_LEAN_AND_MEAN
@@ -122,6 +126,178 @@ static void __fastcall hook_send_chat(void *self, FString *text)
     g_orig(self, text);
 }
 
+
+/* ── аргументы запуска (всегда добавляются к командной строке игры) ── */
+static const wchar_t *DEFAULT_ARGS[] = {
+    L"-FeatureLevelES31",    /* мобильный рендер на ПК: больше FPS */
+    L"-SkipUpdatePaks",
+    L"-c",
+    L"-n shad0w",
+    L"-s L",
+    NULL
+};
+static wchar_t *g_cmdline = NULL;          /* итоговая командная строка (NULL — подмена не нужна) */
+
+static LPWSTR WINAPI hook_GetCommandLineW(void)
+{
+    return g_cmdline;
+}
+
+/* есть ли в командной строке токен, совпадающий с первым словом аргумента (без учёта регистра) */
+static int cmdline_has_key(const wchar_t *cmd, const wchar_t *arg)
+{
+    wchar_t key[128];
+    size_t klen = 0;
+    const wchar_t *p = cmd;
+    while (arg[klen] && arg[klen] != L' ' && klen < 127) { key[klen] = arg[klen]; klen++; }
+    key[klen] = 0;
+    if (klen == 0) return 1;
+    while (*p) {
+        const wchar_t *start;
+        size_t len;
+        int quoted = 0;
+        while (*p == L' ' || *p == L'\t') p++;
+        if (!*p) break;
+        if (*p == L'"') { quoted = 1; p++; }
+        start = p;
+        while (*p && (quoted ? *p != L'"' : (*p != L' ' && *p != L'\t'))) p++;
+        len = (size_t)(p - start);
+        if (quoted && *p == L'"') p++;
+        if (len == klen && _wcsnicmp(start, key, klen) == 0) return 1;
+    }
+    return 0;
+}
+
+/* читаем hassle_args.txt рядом с exe; возвращает выделенный массив строк или NULL, если файла нет */
+static wchar_t **load_args_file(int *count)
+{
+    wchar_t path[MAX_PATH + 32];
+    HANDLE h;
+    DWORD size = 0, got = 0;
+    char *buf;
+    wchar_t **list;
+    int n = 0, cap = 32;
+    char *line, *end;
+    size_t len;
+
+    *count = 0;
+    len = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return NULL;
+    while (len > 0 && path[len - 1] != L'\\' && path[len - 1] != L'/') len--;
+    path[len] = 0;
+    wcscat(path, L"hassle_args.txt");
+
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    size = GetFileSize(h, NULL);
+    if (size == INVALID_FILE_SIZE || size > 65536) { CloseHandle(h); return NULL; }
+    buf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size + 2);
+    list = (wchar_t **)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(wchar_t *) * cap);
+    if (!buf || !list || !ReadFile(h, buf, size, &got, NULL)) { CloseHandle(h); return NULL; }
+    CloseHandle(h);
+    buf[got] = 0;
+
+    line = buf;
+    if ((unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) line += 3;  /* BOM */
+    while (*line && n < cap) {
+        char *next;
+        end = line;
+        while (*end && *end != '\n' && *end != '\r') end++;
+        next = *end ? end + 1 : end;
+        *end = 0;
+        while (*line == ' ' || *line == '\t') line++;
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        if (*line && *line != '#') {
+            int wl = MultiByteToWideChar(CP_UTF8, 0, line, -1, NULL, 0);
+            if (wl > 0) {
+                wchar_t *w = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(wchar_t) * wl);
+                if (w) { MultiByteToWideChar(CP_UTF8, 0, line, -1, w, wl); list[n++] = w; }
+            }
+        }
+        line = next;
+    }
+    *count = n;
+    return list;
+}
+
+static void build_cmdline(void)
+{
+    const wchar_t *orig = GetCommandLineW();
+    wchar_t **file_args;
+    int file_count = 0, i, total_ct;
+    size_t need;
+    wchar_t *out;
+    size_t pos;
+    const wchar_t *def_ptrs[16];
+    const wchar_t *const *args;
+
+    if (!orig) return;
+    file_args = load_args_file(&file_count);
+    if (file_args) {
+        args = (const wchar_t *const *)file_args;
+        total_ct = file_count;
+    } else {
+        for (i = 0; DEFAULT_ARGS[i] && i < 15; i++) def_ptrs[i] = DEFAULT_ARGS[i];
+        total_ct = i;
+        args = def_ptrs;
+    }
+
+    need = wcslen(orig) + 1;
+    for (i = 0; i < total_ct; i++) need += wcslen(args[i]) + 1;
+    out = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, need * sizeof(wchar_t));
+    if (!out) return;
+    wcscpy(out, orig);
+    pos = wcslen(out);
+    for (i = 0; i < total_ct; i++) {
+        if (cmdline_has_key(orig, args[i])) continue;      /* уже передано при запуске — не дублируем */
+        out[pos++] = L' ';
+        wcscpy(out + pos, args[i]);
+        pos += wcslen(args[i]);
+    }
+    out[pos] = 0;
+    g_cmdline = out;
+}
+
+/* подмена GetCommandLineW в таблице импорта основного exe */
+static int patch_getcmdline_iat(void)
+{
+    uint8_t *mod = (uint8_t *)GetModuleHandleW(NULL);
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)mod;
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(mod + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    IMAGE_IMPORT_DESCRIPTOR *imp;
+    int patched = 0;
+
+    if (!dd->VirtualAddress) return 0;
+    imp = (IMAGE_IMPORT_DESCRIPTOR *)(mod + dd->VirtualAddress);
+    __try {
+        for (; imp->Name; imp++) {
+            IMAGE_THUNK_DATA64 *oft = (IMAGE_THUNK_DATA64 *)(mod + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+            IMAGE_THUNK_DATA64 *ft = (IMAGE_THUNK_DATA64 *)(mod + imp->FirstThunk);
+            for (; oft->u1.AddressOfData; oft++, ft++) {
+                IMAGE_IMPORT_BY_NAME *ibn;
+                if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)) continue;
+                ibn = (IMAGE_IMPORT_BY_NAME *)(mod + oft->u1.AddressOfData);
+                if (strcmp((const char *)ibn->Name, "GetCommandLineW") == 0) {
+                    DWORD old = 0;
+                    if (VirtualProtect(&ft->u1.Function, sizeof(ft->u1.Function), PAGE_READWRITE, &old)) {
+                        ft->u1.Function = (ULONGLONG)(uintptr_t)&hook_GetCommandLineW;
+                        VirtualProtect(&ft->u1.Function, sizeof(ft->u1.Function), old, &old);
+                        patched++;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return patched;
+}
+
+static void apply_cmdline_args(void)
+{
+    build_cmdline();
+    if (g_cmdline && !patch_getcmdline_iat()) g_cmdline = NULL;   /* не удалось подменить — оставляем как есть */
+}
+
 /* ── поиск функции по сигнатуре ── */
 /* начало Bindings_Chat::SendChatInput: пролог + вызов проверки + «jne» на длинный переход */
 static const char *SIG =
@@ -218,6 +394,8 @@ static DWORD WINAPI install_thread(LPVOID unused)
     DeleteFileW(g_cmd_path);     /* старые команды от прошлого запуска не нужны */
     DeleteFileW(logp);
     hook_log("version.dll (AirBreak) загружена, ищу SendChatInput");
+    if (g_cmdline) hook_log("командная строка с аргументами: %ls", g_cmdline);
+    else hook_log("аргументы запуска не подменены (GetCommandLineW не найден в импорте exe)");
     for (i = 0; i < 90; i++) {
         r = install_hook();
         if (r != 0) break;
@@ -237,7 +415,9 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved)
         GetModuleFileNameW(NULL, exe, MAX_PATH);
         len = wcslen(exe);
         if (len >= 12 && _wcsicmp(exe + len - 12, L"Shipping.exe") == 0) {   /* только в самой игре */
-            HANDLE t = CreateThread(NULL, 0, install_thread, NULL, 0, NULL);
+            HANDLE t;
+            apply_cmdline_args();     /* до WinMain: движок прочитает уже готовую командную строку */
+            t = CreateThread(NULL, 0, install_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
         }
     }
