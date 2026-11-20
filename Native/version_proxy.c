@@ -559,10 +559,31 @@ static void p_report(void)
     }
 }
 
+
+/* таблица записей для сопоставления с машиной */
+typedef struct { uint64_t addr; uint32_t id; uint32_t v[7]; } PEnt;   /* v: mass turnmass accel inertia speed brake traction */
+#define P_MAXENT 2048
+static PEnt g_ent[P_MAXENT];
+static int g_nent = 0;
+static void p_ent_add(uint64_t addr, const uint8_t *e)
+{
+    int i;
+    PEnt *t;
+    if (g_nent >= P_MAXENT) return;
+    for (i = 0; i < g_nent; i++) if (g_ent[i].addr == addr) return;
+    t = &g_ent[g_nent++];
+    t->addr = addr;
+    memcpy(&t->id, e, 4);
+    memcpy(&t->v[0], e + 0x04, 4); memcpy(&t->v[1], e + 0x0C, 4); memcpy(&t->v[2], e + 0x58, 4);
+    memcpy(&t->v[3], e + 0x5C, 4); memcpy(&t->v[4], e + 0x60, 4); memcpy(&t->v[5], e + 0x70, 4);
+    memcpy(&t->v[6], e + 0x38, 4);
+}
+
 /* полный обход таблицы: для каждого блока с кандидатами идём шагом 0xC0 от найденной записи вверх и вниз */
 #define P_STRIDE 0xC0
 static uint8_t g_big[0x40100];
-static void p_enum(void)
+#define PREP if (print) rep
+static void p_enum(int print)
 {
     uint64_t blks[32]; unsigned phs[32];
     int nb = 0, i, b;
@@ -574,12 +595,12 @@ static void p_enum(void)
         for (b = 0; b < nb; b++) if (blks[b] == g_pc[i].blk && phs[b] == ph) dup = 1;
         if (!dup) { blks[nb] = g_pc[i].blk; phs[nb] = ph; nb++; }
     }
-    rep("\n══ ТАБЛИЦА хендлингов: блоков %d, шаг записи 0x%X ══\n", nb, P_STRIDE);
-    rep("колонки: адрес записи | w0 | mass turnmass drag traction accel inertia speed brake brakebias steer | gears flags | слова +0xB0..+0xBC\n");
+    PREP("\n══ ТАБЛИЦА хендлингов: блоков %d, шаг записи 0x%X ══\n", nb, P_STRIDE);
+    PREP("колонки: адрес записи | w0 | mass turnmass drag traction accel inertia speed brake brakebias steer | gears flags | слова +0xB0..+0xBC\n");
     for (b = 0; b < nb; b++) {
         size_t got = g_pread(blks[b], g_big, 0x40000), off;
         int cnt = 0;
-        rep("\nблок 0x%llX фаза 0x%X (прочитано 0x%llX)\n", (unsigned long long)blks[b], phs[b], (unsigned long long)got);
+        PREP("\nблок 0x%llX фаза 0x%X (прочитано 0x%llX)\n", (unsigned long long)blks[b], phs[b], (unsigned long long)got);
         for (off = phs[b]; off + P_STRIDE <= got; off += P_STRIDE) {
             const uint8_t *e = g_big + off;
             float mass, trac, spd, turn, drag, acc, inr, brk, bias, str;
@@ -588,15 +609,89 @@ static void p_enum(void)
             if (!(mass >= 100.0f && mass <= 200000.0f && spd >= 1.0f && spd <= 1000.0f && trac >= 0.01f && trac <= 50.0f)) continue;
             if (cnt >= 400) break;
             cnt++;
+            p_ent_add(blks[b] + off, e);
             memcpy(&w0, e, 4); memcpy(&turn, e + 0x0C, 4); memcpy(&drag, e + 0x10, 4); memcpy(&acc, e + 0x58, 4);
             memcpy(&inr, e + 0x5C, 4); memcpy(&brk, e + 0x70, 4); memcpy(&bias, e + 0x74, 4); memcpy(&str, e + 0x78, 4);
             memcpy(&fl, e + 0xA8, 4); memcpy(&n0, e + 0xB0, 4); memcpy(&n1, e + 0xB4, 4); memcpy(&n2, e + 0xB8, 4); memcpy(&n3, e + 0xBC, 4);
-            rep("0x%llX | %u | %g %g %g %g %g %g %g %g %g %g | %u %08X | %08X %08X %08X %08X\n",
+            PREP("0x%llX | %u | %g %g %g %g %g %g %g %g %g %g | %u %08X | %08X %08X %08X %08X\n",
                 (unsigned long long)(blks[b] + off), (unsigned)w0, (double)mass, (double)turn, (double)drag, (double)trac,
                 (double)acc, (double)inr, (double)spd, (double)brk, (double)bias, (double)str,
                 (unsigned)e[0x52], (unsigned)fl, (unsigned)n0, (unsigned)n1, (unsigned)n2, (unsigned)n3);
         }
-        rep("  записей в блоке: %d\n", cnt);
+        PREP("  записей в блоке: %d\n", cnt);
+    }
+}
+
+#undef PREP
+/* ── сопоставление: чьи значения (масса, ускорение, скорость…) лежат в памяти самой машины ── */
+#define HS_BITS 20
+#define HS_SIZE (1u << HS_BITS)
+static uint32_t g_hs[HS_SIZE];
+static unsigned long g_hs_n = 0;
+static void hs_add(uint32_t v)
+{
+    uint32_t h;
+    if (!v || g_hs_n > 700000UL) return;
+    h = (v * 2654435761u) >> (32 - HS_BITS);
+    for (;; h = (h + 1) & (HS_SIZE - 1)) {
+        if (g_hs[h] == v) return;
+        if (!g_hs[h]) { g_hs[h] = v; g_hs_n++; return; }
+    }
+}
+static int hs_has(uint32_t v)
+{
+    uint32_t h;
+    if (!v) return 0;
+    h = (v * 2654435761u) >> (32 - HS_BITS);
+    for (;; h = (h + 1) & (HS_SIZE - 1)) {
+        if (g_hs[h] == v) return 1;
+        if (!g_hs[h]) return 0;
+    }
+}
+static void p_collect(uint64_t root, size_t rootsz, size_t win1)
+{
+    size_t got, i, k, g1;
+    if (rootsz > sizeof(g_root)) rootsz = sizeof(g_root);
+    if (win1 > sizeof(g_b1) - 0x100) win1 = sizeof(g_b1) - 0x100;
+    got = g_pread(root, g_root, rootsz);
+    for (i = 0; i + 4 <= got; i += 4) { uint32_t w; memcpy(&w, g_root + i, 4); hs_add(w); }
+    for (i = 0; i + 8 <= got; i += 8) {
+        uint64_t p;
+        memcpy(&p, g_root + i, 8);
+        if (!p_ptr_ok(p)) continue;
+        g1 = g_pread(p, g_b1, win1);
+        for (k = 0; k + 4 <= g1; k += 4) { uint32_t w; memcpy(&w, g_b1 + k, 4); hs_add(w); }
+    }
+}
+static void p_vehmatch(uint64_t veh, uint64_t cfg)
+{
+    int i, j, best[10], nb = 0;
+    int sc[P_MAXENT];
+    memset(g_hs, 0, sizeof(g_hs));
+    g_hs_n = 0;
+    if (veh) p_collect(veh, 0x2000, 0x800);
+    if (cfg) p_collect(cfg, 0x400, 0x400);
+    rep("\n══ СОВПАДЕНИЯ: записи таблицы, чьи значения есть в памяти машины (слов в наборе: %lu, записей: %d) ══\n", g_hs_n, g_nent);
+    for (i = 0; i < g_nent; i++) {
+        int c = 0;
+        for (j = 0; j < 7; j++) if (hs_has(g_ent[i].v[j])) c++;
+        sc[i] = c;
+    }
+    for (i = 0; i < g_nent; i++) {                 /* топ-10 по числу совпадений (из 7) */
+        int pos = nb;
+        if (sc[i] < 2) continue;
+        if (nb < 10) nb++; else if (sc[best[9]] >= sc[i]) continue; else pos = 9;
+        while (pos > 0 && sc[best[pos - 1]] < sc[i]) { if (pos < 10) best[pos] = best[pos - 1]; pos--; }
+        best[pos] = i;
+    }
+    if (nb == 0) rep("совпадений (>=2 из 7) нет: машина не хранит копию значений хендлинга\n");
+    for (i = 0; i < nb; i++) {
+        PEnt *t = &g_ent[best[i]];
+        float f[7];
+        memcpy(f, t->v, sizeof(f));
+        rep("  %d/7  id=%u  адрес записи 0x%llX  mass=%g turn=%g accel=%g inertia=%g speed=%g brake=%g trac=%g\n",
+            sc[best[i]], (unsigned)t->id, (unsigned long long)t->addr,
+            (double)f[0], (double)f[1], (double)f[2], (double)f[3], (double)f[4], (double)f[5], (double)f[6]);
     }
 }
 /* PROBE_CORE_END */
@@ -635,16 +730,18 @@ static void probe_write_report(void)
     hook_log("probe: отчёт vtune_probe.txt записан (%lu байт), кандидатов: %d", (unsigned long)w, g_npc);
 }
 
-static void run_probe(uint64_t veh, uint64_t sub)
+static void run_probe(uint64_t veh, uint64_t sub, uint64_t cfg)
 {
     g_pread = win_read;
-    g_replen = 0; g_npc = 0; g_pblocks = 0; g_pfail = 0; g_pptrs = 0;
-    rep("VTune probe (version.dll): veh=0x%llX sub=0x%llX\n", (unsigned long long)veh, (unsigned long long)sub);
+    g_replen = 0; g_nent = 0; g_npc = 0; g_pblocks = 0; g_pfail = 0; g_pptrs = 0;
+    rep("VTune probe (version.dll): veh=0x%llX sub=0x%llX cfg=0x%llX\n", (unsigned long long)veh, (unsigned long long)sub, (unsigned long long)cfg);
     __try {
         if (veh) p_probe("veh", veh, 0x2000, 0x800, 64, 0x400, 6);
         if (sub) p_probe("sub", sub, 0x400, 0x10000, 64, 0x4000, 6);
         p_report();
-        p_enum();
+        p_enum(0);                  /* тихий проход: собрать записи */
+        p_vehmatch(veh, cfg);       /* сопоставление идёт первым — чтобы не потерялось при обрезке отчёта */
+        p_enum(1);                  /* полный список записей */
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         rep("\nИСКЛЮЧЕНИЕ внутри probe — отчёт неполный\n");
     }
@@ -678,7 +775,7 @@ static DWORD WINAPI probe_thread(LPVOID unused)
         if (got < 6) continue;                 /* файл ещё дописывается — подождём следующего тика */
         DeleteFileW(req);
         hook_log("probe: запрос получен: %s", buf);
-        run_probe(parse_hex_key(buf, "veh="), parse_hex_key(buf, "sub="));
+        run_probe(parse_hex_key(buf, "veh="), parse_hex_key(buf, "sub="), parse_hex_key(buf, "cfg="));
     }
     return 0;
 }
