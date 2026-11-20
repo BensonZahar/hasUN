@@ -570,7 +570,10 @@ static void p_ent_add(uint64_t addr, const uint8_t *e)
 {
     int i;
     PEnt *t;
+    uint32_t id0;
     if (g_nent >= P_MAXENT) return;
+    memcpy(&id0, e, 4);
+    if ((addr & 0xF) != 0 || id0 > 100000u) return;   /* мусор: настоящие записи лежат по адресу кратному 16 (MakeShared 0xC0 + 0x10), id маленький */
     for (i = 0; i < g_nent; i++) if (g_ent[i].addr == addr) return;
     t = &g_ent[g_nent++];
     t->addr = addr;
@@ -877,6 +880,12 @@ static void tbl_get(uint32_t id)
 }
 
 /* who: «all», «N» или «A-B» */
+static int tbl_orig(uint64_t a, uint32_t *old)
+{
+    int k;
+    for (k = 0; k < g_nundo; k++) if (g_undo[k].addr == a) { *old = g_undo[k].old; return 1; }
+    return 0;
+}
 static void tbl_set(const char *who, const TblField *f, float val, int mul)
 {
     unsigned long lo = 0, hi = 0xFFFFFFFFUL;
@@ -898,11 +907,11 @@ static void tbl_set(const char *who, const TblField *f, float val, int mul)
         a = t->addr + f->off;
         if (g_pread(a, &w, 4) != 4) { bad++; continue; }
         memcpy(&cur, &w, 4);
-        nv = mul ? cur * val : val;
+        { uint32_t ow; float of = cur; if (tbl_orig(a, &ow)) memcpy(&of, &ow, 4); nv = mul ? of * val : val; }
         if (!(nv == nv) || nv > 1e7f || nv < -1e7f) { bad++; continue; }
         if (g_nundo >= TBL_MAXUNDO) { hook_log("tbl: слишком много правок — сделайте «reset»"); break; }
         if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)(uintptr_t)a, &nv, 4, &wr) || wr != 4) { bad++; continue; }
-        g_undo[g_nundo].addr = a; g_undo[g_nundo].old = w; g_nundo++;
+        { uint32_t ow; if (!tbl_orig(a, &ow)) { g_undo[g_nundo].addr = a; g_undo[g_nundo].old = w; g_nundo++; } }
         if (!changed) { first_old = cur; first_new = nv; }
         changed++;
     }
@@ -961,7 +970,7 @@ static void tbl_poll(void)
     DWORD got = 0;
     char *line, *next;
     uint64_t sub = 0;
-    int force = 0;
+    int force = 0, refreshed = 0;
     temp_path(L"vtune_tbl_req.txt", req, sizeof(req) / sizeof(req[0]));
     if (GetFileAttributesW(req) == INVALID_FILE_ATTRIBUTES) return;
     h = CreateFileW(req, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -978,10 +987,10 @@ static void tbl_poll(void)
         if (strncmp(line, "sub=", 4) == 0) { sub = strtoull(line + 4, NULL, 16); continue; }
         if (_stricmp(line, "refresh") == 0) { force = 1; continue; }
         if (!line[0]) continue;
-        if (g_nent == 0 || force || (sub && sub != g_tbl_sub)) {
+        if (!refreshed && (g_nent == 0 || force || sub)) {
             if (!sub) { hook_log("tbl: нет адреса подсистемы"); return; }
             if (tbl_refresh(sub) == 0) { hook_log("tbl: таблица не найдена"); return; }
-            force = 0;
+            force = 0; refreshed = 1;
         }
         __try { tbl_exec(line); }
         __except (EXCEPTION_EXECUTE_HANDLER) { hook_log("tbl: исключение при выполнении команды"); }
