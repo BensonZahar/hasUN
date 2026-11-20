@@ -5,8 +5,9 @@
  * настоящей version.dll и дополнительно ставит хук на функцию игры Bindings_Chat::SendChatInput
  * (адрес ищется по сигнатуре, поэтому работает при смене базового адреса exe).
  *
- * Если текст в чате начинается с «/air», хук записывает его в файл %TEMP%\airbreak_chat.txt
- * и НЕ отправляет сообщение на сервер. Lua-мод AirBreak читает этот файл и выполняет команду.
+ * Если текст в чате начинается с «/air», хук записывает его в файл %TEMP%\airbreak_chat.txt,
+ * а если с «/vtune» — в %TEMP%\vtune_chat.txt, и НЕ отправляет сообщение на сервер.
+ * Lua-моды AirBreak и VTune читают свои файлы и выполняют команды.
  * Любое другое сообщение уходит как обычно.
  *
  * Состояние хука пишется в %TEMP%\airbreak_hook.log (мод AirBreak перепечатает его в UE4SS.log).
@@ -96,19 +97,27 @@ static void hook_log(const char *fmt, ...)
 typedef struct { wchar_t *Data; int Num; int Max; } FString;   /* Num включает завершающий ноль */
 typedef void (__fastcall *SendChat_t)(void *self, FString *text);
 static SendChat_t g_orig = NULL;
-static wchar_t g_cmd_path[MAX_PATH + 32];
+/* маршруты команд чата: «/имя» -> файл в %TEMP%, который читает соответствующий Lua-мод */
+typedef struct { const wchar_t *cmd; const wchar_t *file; wchar_t path[MAX_PATH + 32]; } ChatRoute;
+static ChatRoute g_routes[] = {
+    { L"air",   L"airbreak_chat.txt", { 0 } },
+    { L"vtune", L"vtune_chat.txt",    { 0 } },
+};
+#define NROUTES ((int)(sizeof(g_routes) / sizeof(g_routes[0])))
 
-static int is_air_cmd(const FString *s)
+/* текст = «/cmd» или «/cmd <что-то>» (без учёта регистра) */
+static int is_route_cmd(const FString *s, const wchar_t *cmd)
 {
     const wchar_t *t;
-    if (!s || !s->Data || s->Num < 5) return 0;      /* "/air" + ноль = 5 */
+    size_t n = wcslen(cmd), k;
+    if (!s || !s->Data || (size_t)s->Num < n + 2) return 0;     /* «/» + имя + ноль */
     t = s->Data;
     if (t[0] != L'/') return 0;
-    if ((t[1] | 0x20) != L'a' || (t[2] | 0x20) != L'i' || (t[3] | 0x20) != L'r') return 0;
-    return t[4] == 0 || t[4] == L' ' || t[4] == L'\t';
+    for (k = 0; k < n; k++) if ((t[1 + k] | 0x20) != (cmd[k] | 0x20)) return 0;
+    return t[1 + n] == 0 || t[1 + n] == L' ' || t[1 + n] == L'\t';
 }
 
-static void emit_cmd(const FString *s)
+static void emit_cmd(const wchar_t *path, const FString *s)
 {
     char utf8[1500];
     int wlen = s->Num - 1, n, i;
@@ -117,12 +126,15 @@ static void emit_cmd(const FString *s)
     if (n <= 0) return;
     for (i = 0; i < n; i++) if (utf8[i] == '\r' || utf8[i] == '\n') utf8[i] = ' ';
     utf8[n++] = '\n';
-    append_file(g_cmd_path, utf8, (DWORD)n);
+    append_file(path, utf8, (DWORD)n);
 }
 
 static void __fastcall hook_send_chat(void *self, FString *text)
 {
-    if (is_air_cmd(text)) { emit_cmd(text); return; }   /* команда AirBreak: на сервер не отправляем */
+    int i;
+    for (i = 0; i < NROUTES; i++) {
+        if (is_route_cmd(text, g_routes[i].cmd)) { emit_cmd(g_routes[i].path, text); return; }   /* команда мода: на сервер не отправляем */
+    }
     g_orig(self, text);
 }
 
@@ -389,11 +401,13 @@ static DWORD WINAPI install_thread(LPVOID unused)
     int i, r = 0;
     wchar_t logp[MAX_PATH + 32];
     (void)unused;
-    temp_path(L"airbreak_chat.txt", g_cmd_path, sizeof(g_cmd_path) / sizeof(g_cmd_path[0]));
+    for (i = 0; i < NROUTES; i++) {
+        temp_path(g_routes[i].file, g_routes[i].path, sizeof(g_routes[i].path) / sizeof(g_routes[i].path[0]));
+        DeleteFileW(g_routes[i].path);     /* старые команды от прошлого запуска не нужны */
+    }
     temp_path(L"airbreak_hook.log", logp, sizeof(logp) / sizeof(logp[0]));
-    DeleteFileW(g_cmd_path);     /* старые команды от прошлого запуска не нужны */
     DeleteFileW(logp);
-    hook_log("version.dll (AirBreak) загружена, ищу SendChatInput");
+    hook_log("version.dll (AirBreak) загружена, ищу SendChatInput (команды: /air, /vtune)");
     if (g_cmdline) hook_log("командная строка с аргументами: %ls", g_cmdline);
     else hook_log("аргументы запуска не подменены (GetCommandLineW не найден в импорте exe)");
     for (i = 0; i < 90; i++) {
