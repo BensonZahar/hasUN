@@ -10,6 +10,9 @@
  * Lua-моды AirBreak и VTune читают свои файлы и выполняют команды.
  * Любое другое сообщение уходит как обычно.
  *
+ * /vtune probe (запрос от Lua-мода VTune) запускает поиск структуры хендлинга за указателями, отчёт — vtune_probe.txt
+ * рядом с exe (только чтение памяти).
+ *
  * Состояние хука пишется в %TEMP%\airbreak_hook.log (мод AirBreak перепечатает его в UE4SS.log).
  *
  * Аргументы запуска: до старта движка подменяем GetCommandLineW в таблице импорта exe и дописываем
@@ -23,6 +26,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 /* ── пересылка экспорта настоящей version.dll ── */
 #define FWD(n) __pragma(comment(linker, "/EXPORT:" #n "=C:\\Windows\\System32\\version." #n))
@@ -396,6 +400,245 @@ static int install_hook(void)
     return 1;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * PROBE: поиск структуры хендлинга за указателями.
+ * Запрос приходит из Lua-мода VTune (/vtune probe): файл %TEMP%\vtune_probe_req.txt со строками
+ *   veh=0x<адрес объекта машины>   sub=0x<адрес HandlingDataSubsystem>
+ * Мы читаем память безопасно (ReadProcessMemory на себя), ищем по сигнатуре значений структуру
+ * хендлинга: прямо в объекте, за указателем и за указателем второго уровня. Отчёт пишется рядом с exe
+ * в vtune_probe.txt. Ничего в игре НЕ изменяется — только чтение.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+/* PROBE_CORE_BEGIN */
+typedef size_t (*probe_read_fn)(uint64_t addr, void *buf, size_t n);   /* возвращает, сколько байт прочитано */
+static probe_read_fn g_pread = NULL;
+
+static char   g_rep[65536];
+static size_t g_replen = 0;
+static void rep(const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    size_t room;
+    if (g_replen + 2 >= sizeof(g_rep)) return;
+    room = sizeof(g_rep) - g_replen - 1;
+    va_start(ap, fmt);
+    n = vsnprintf(g_rep + g_replen, room, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n >= room) n = (int)room - 1;
+    g_replen += (size_t)n;
+}
+
+typedef struct { int off; float lo, hi; } PChk;
+static const PChk P_CHK[8] = {
+    { 0x04, 200.0f, 40000.0f },   /* mass */
+    { 0x10, 0.0f, 30.0f },        /* drag */
+    { 0x38, 0.05f, 10.0f },       /* traction */
+    { 0x58, 0.001f, 5.0f },       /* accel */
+    { 0x60, 5.0f, 600.0f },       /* speed */
+    { 0x70, 0.05f, 30.0f },       /* brake */
+    { 0x74, 0.0f, 1.0f },         /* brakebias */
+    { 0x78, 5.0f, 90.0f },        /* steer */
+};
+#define P_STRUCT_MIN 0x7C
+#define P_DETAIL_BYTES 0xB0
+
+static int p_score(const uint8_t *p, int minscore)
+{
+    int fails = 0, k, maxfail = 8 - minscore;
+    for (k = 0; k < 8; k++) {
+        float f;
+        memcpy(&f, p + P_CHK[k].off, 4);
+        if (!(f >= P_CHK[k].lo && f <= P_CHK[k].hi)) { if (++fails > maxfail) return 0; }
+    }
+    return 8 - fails;
+}
+
+#define P_MAXC 48
+typedef struct { uint64_t addr; int score; char path[128]; } PCand;
+static PCand g_pc[P_MAXC];
+static int g_npc = 0;
+static unsigned long g_pblocks = 0, g_pfail = 0, g_pptrs = 0;
+
+static void p_add(uint64_t addr, int score, const char *path)
+{
+    int i, worst = 0;
+    for (i = 0; i < g_npc; i++) if (g_pc[i].addr == addr) return;
+    if (g_npc < P_MAXC) {
+        i = g_npc++;
+    } else {
+        for (i = 1; i < g_npc; i++) if (g_pc[i].score < g_pc[worst].score) worst = i;
+        if (g_pc[worst].score >= score) return;
+        i = worst;
+    }
+    g_pc[i].addr = addr;
+    g_pc[i].score = score;
+    snprintf(g_pc[i].path, sizeof(g_pc[i].path), "%s", path);
+}
+
+/* просмотреть блок памяти: структура может начинаться с любого 4-байтного смещения */
+static void p_scan(uint64_t base, const uint8_t *buf, size_t len, const char *path, int minscore)
+{
+    size_t off;
+    char tmp[128];
+    if (len < P_STRUCT_MIN) return;
+    g_pblocks++;
+    for (off = 0; off + P_STRUCT_MIN <= len; off += 4) {
+        int s = p_score(buf + off, minscore);
+        if (s >= minscore) {
+            snprintf(tmp, sizeof(tmp), "%s+0x%llX", path, (unsigned long long)off);
+            p_add(base + off, s, tmp);
+        }
+    }
+}
+
+static int p_ptr_ok(uint64_t v) { return v >= 0x10000ULL && v < 0x800000000000ULL && (v & 7) == 0; }
+
+static uint8_t g_root[0x2400], g_b1[0x10100], g_b2[0x4100];
+
+static void p_probe(const char *label, uint64_t root, size_t rootsz, size_t win1, size_t l2words, size_t win2, int minscore)
+{
+    size_t got, got1, got2, i, j;
+    char path[96], path2[128];
+    if (rootsz > sizeof(g_root)) rootsz = sizeof(g_root);
+    if (win1 > sizeof(g_b1) - 0x100) win1 = sizeof(g_b1) - 0x100;
+    if (win2 > sizeof(g_b2) - 0x100) win2 = sizeof(g_b2) - 0x100;
+    got = g_pread(root, g_root, rootsz);
+    rep("── %s: объект 0x%llX, прочитано 0x%llX из 0x%llX байт ──\n", label, (unsigned long long)root,
+        (unsigned long long)got, (unsigned long long)rootsz);
+    if (got < 8) { rep("  объект не читается\n"); return; }
+    p_scan(root, g_root, got, label, minscore);                       /* уровень 0: прямо в объекте */
+    for (i = 0; i + 8 <= got; i += 8) {                                 /* уровень 1: слова-указатели объекта */
+        uint64_t p;
+        memcpy(&p, g_root + i, 8);
+        if (!p_ptr_ok(p)) continue;
+        g_pptrs++;
+        got1 = g_pread(p, g_b1, win1);
+        if (got1 < P_STRUCT_MIN) { g_pfail++; continue; }
+        snprintf(path, sizeof(path), "%s+0x%llX->", label, (unsigned long long)i);
+        p_scan(p, g_b1, got1, path, minscore);
+        for (j = 0; j < l2words && j * 8 + 8 <= got1; j++) {          /* уровень 2: указатели внутри блока */
+            uint64_t q;
+            memcpy(&q, g_b1 + j * 8, 8);
+            if (!p_ptr_ok(q) || q == p) continue;
+            got2 = g_pread(q, g_b2, win2);
+            if (got2 < P_STRUCT_MIN) continue;
+            snprintf(path2, sizeof(path2), "%s+0x%llX->+0x%llX->", label, (unsigned long long)i, (unsigned long long)(j * 8));
+            p_scan(q, g_b2, got2, path2, minscore);
+        }
+    }
+}
+
+static void p_report(void)
+{
+    int i, j, n;
+    uint8_t buf[P_DETAIL_BYTES];
+    for (i = 1; i < g_npc; i++) {                                       /* сортировка по убыванию баллов */
+        PCand t = g_pc[i];
+        for (j = i - 1; j >= 0 && g_pc[j].score < t.score; j--) g_pc[j + 1] = g_pc[j];
+        g_pc[j + 1] = t;
+    }
+    rep("\nпросмотрено блоков: %lu, указателей: %lu, нечитаемых: %lu\n", g_pblocks, g_pptrs, g_pfail);
+    rep("кандидатов: %d (баллов из 8; настоящая структура даёт 8 и повторяется при каждом запуске)\n", g_npc);
+    n = g_npc < 30 ? g_npc : 30;
+    for (i = 0; i < n; i++) rep("  %d/8  0x%llX  %s\n", g_pc[i].score, (unsigned long long)g_pc[i].addr, g_pc[i].path);
+    n = g_npc < 6 ? g_npc : 6;
+    for (i = 0; i < n; i++) {
+        size_t got = g_pread(g_pc[i].addr, buf, sizeof(buf));
+        size_t w;
+        rep("\n[%d] %d/8  0x%llX  %s  (слова: смещение, hex, float)\n", i + 1, g_pc[i].score,
+            (unsigned long long)g_pc[i].addr, g_pc[i].path);
+        for (w = 0; w + 4 <= got; w += 4) {
+            uint32_t u;
+            float f;
+            memcpy(&u, buf + w, 4);
+            memcpy(&f, buf + w, 4);
+            rep("  +0x%02X  %08X  %g\n", (unsigned)w, (unsigned)u, (double)f);
+        }
+    }
+}
+/* PROBE_CORE_END */
+
+/* ── Windows-часть: чтение памяти, запрос, отчёт ── */
+static size_t win_read(uint64_t addr, void *buf, size_t n)
+{
+    size_t done = 0;
+    HANDLE self = GetCurrentProcess();
+    while (done < n) {
+        uint64_t cur = addr + done;
+        size_t pageleft = 0x1000 - (size_t)(cur & 0xFFF);
+        size_t c = (n - done < pageleft) ? (n - done) : pageleft;
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(self, (LPCVOID)(uintptr_t)cur, (uint8_t *)buf + done, c, &got) || got != c) break;
+        done += c;
+    }
+    return done;
+}
+
+static void probe_write_report(void)
+{
+    wchar_t path[MAX_PATH + 32];
+    size_t len;
+    HANDLE h;
+    DWORD w = 0;
+    len = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return;
+    while (len > 0 && path[len - 1] != L'\\' && path[len - 1] != L'/') len--;
+    path[len] = 0;
+    wcscat(path, L"vtune_probe.txt");
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { hook_log("probe: не удалось создать vtune_probe.txt (%lu)", GetLastError()); return; }
+    WriteFile(h, g_rep, (DWORD)g_replen, &w, NULL);
+    CloseHandle(h);
+    hook_log("probe: отчёт vtune_probe.txt записан (%lu байт), кандидатов: %d", (unsigned long)w, g_npc);
+}
+
+static void run_probe(uint64_t veh, uint64_t sub)
+{
+    g_pread = win_read;
+    g_replen = 0; g_npc = 0; g_pblocks = 0; g_pfail = 0; g_pptrs = 0;
+    rep("VTune probe (version.dll): veh=0x%llX sub=0x%llX\n", (unsigned long long)veh, (unsigned long long)sub);
+    __try {
+        if (veh) p_probe("veh", veh, 0x2000, 0x800, 64, 0x400, 6);
+        if (sub) p_probe("sub", sub, 0x400, 0x10000, 64, 0x4000, 6);
+        p_report();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        rep("\nИСКЛЮЧЕНИЕ внутри probe — отчёт неполный\n");
+    }
+    probe_write_report();
+}
+
+static unsigned long long parse_hex_key(const char *buf, const char *key)
+{
+    const char *p = strstr(buf, key);
+    if (!p) return 0;
+    return strtoull(p + strlen(key), NULL, 16);
+}
+
+static DWORD WINAPI probe_thread(LPVOID unused)
+{
+    wchar_t req[MAX_PATH + 32];
+    (void)unused;
+    temp_path(L"vtune_probe_req.txt", req, sizeof(req) / sizeof(req[0]));
+    DeleteFileW(req);
+    for (;;) {
+        HANDLE h;
+        char buf[256];
+        DWORD got = 0;
+        Sleep(300);
+        if (GetFileAttributesW(req) == INVALID_FILE_ATTRIBUTES) continue;
+        h = CreateFileW(req, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
+        CloseHandle(h);
+        buf[got] = 0;
+        if (got < 6) continue;                 /* файл ещё дописывается — подождём следующего тика */
+        DeleteFileW(req);
+        run_probe(parse_hex_key(buf, "veh="), parse_hex_key(buf, "sub="));
+    }
+    return 0;
+}
+
 static DWORD WINAPI install_thread(LPVOID unused)
 {
     int i, r = 0;
@@ -432,6 +675,8 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved)
             HANDLE t;
             apply_cmdline_args();     /* до WinMain: движок прочитает уже готовую командную строку */
             t = CreateThread(NULL, 0, install_thread, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            t = CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);     /* /vtune probe: поиск структуры хендлинга */
             if (t) CloseHandle(t);
         }
     }
