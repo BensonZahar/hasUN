@@ -412,7 +412,7 @@ static int install_hook(void)
 typedef size_t (*probe_read_fn)(uint64_t addr, void *buf, size_t n);   /* возвращает, сколько байт прочитано */
 static probe_read_fn g_pread = NULL;
 
-static char   g_rep[65536];
+static char   g_rep[262144];
 static size_t g_replen = 0;
 static void rep(const char *fmt, ...)
 {
@@ -454,13 +454,13 @@ static int p_score(const uint8_t *p, int minscore)
     return 8 - fails;
 }
 
-#define P_MAXC 48
-typedef struct { uint64_t addr; int score; char path[128]; } PCand;
+#define P_MAXC 160
+typedef struct { uint64_t addr; uint64_t blk; int score; char path[128]; } PCand;
 static PCand g_pc[P_MAXC];
 static int g_npc = 0;
 static unsigned long g_pblocks = 0, g_pfail = 0, g_pptrs = 0;
 
-static void p_add(uint64_t addr, int score, const char *path)
+static void p_add(uint64_t addr, uint64_t blk, int score, const char *path)
 {
     int i, worst = 0;
     for (i = 0; i < g_npc; i++) if (g_pc[i].addr == addr) return;
@@ -472,6 +472,7 @@ static void p_add(uint64_t addr, int score, const char *path)
         i = worst;
     }
     g_pc[i].addr = addr;
+    g_pc[i].blk = blk;
     g_pc[i].score = score;
     snprintf(g_pc[i].path, sizeof(g_pc[i].path), "%s", path);
 }
@@ -487,7 +488,7 @@ static void p_scan(uint64_t base, const uint8_t *buf, size_t len, const char *pa
         int s = p_score(buf + off, minscore);
         if (s >= minscore) {
             snprintf(tmp, sizeof(tmp), "%s+0x%llX", path, (unsigned long long)off);
-            p_add(base + off, s, tmp);
+            p_add(base + off, base, s, tmp);
         }
     }
 }
@@ -557,6 +558,47 @@ static void p_report(void)
         }
     }
 }
+
+/* полный обход таблицы: для каждого блока с кандидатами идём шагом 0xC0 от найденной записи вверх и вниз */
+#define P_STRIDE 0xC0
+static uint8_t g_big[0x40100];
+static void p_enum(void)
+{
+    uint64_t blks[32]; unsigned phs[32];
+    int nb = 0, i, b;
+    for (i = 0; i < g_npc && nb < 32; i++) {
+        unsigned ph;
+        int dup = 0;
+        if (g_pc[i].score < 6) continue;
+        ph = (unsigned)((g_pc[i].addr - g_pc[i].blk) % P_STRIDE);
+        for (b = 0; b < nb; b++) if (blks[b] == g_pc[i].blk && phs[b] == ph) dup = 1;
+        if (!dup) { blks[nb] = g_pc[i].blk; phs[nb] = ph; nb++; }
+    }
+    rep("\n══ ТАБЛИЦА хендлингов: блоков %d, шаг записи 0x%X ══\n", nb, P_STRIDE);
+    rep("колонки: адрес записи | w0 | mass turnmass drag traction accel inertia speed brake brakebias steer | gears flags | слова +0xB0..+0xBC\n");
+    for (b = 0; b < nb; b++) {
+        size_t got = g_pread(blks[b], g_big, 0x40000), off;
+        int cnt = 0;
+        rep("\nблок 0x%llX фаза 0x%X (прочитано 0x%llX)\n", (unsigned long long)blks[b], phs[b], (unsigned long long)got);
+        for (off = phs[b]; off + P_STRIDE <= got; off += P_STRIDE) {
+            const uint8_t *e = g_big + off;
+            float mass, trac, spd, turn, drag, acc, inr, brk, bias, str;
+            uint32_t w0, fl, n0, n1, n2, n3;
+            memcpy(&mass, e + 0x04, 4); memcpy(&trac, e + 0x38, 4); memcpy(&spd, e + 0x60, 4);
+            if (!(mass >= 100.0f && mass <= 200000.0f && spd >= 1.0f && spd <= 1000.0f && trac >= 0.01f && trac <= 50.0f)) continue;
+            if (cnt >= 400) break;
+            cnt++;
+            memcpy(&w0, e, 4); memcpy(&turn, e + 0x0C, 4); memcpy(&drag, e + 0x10, 4); memcpy(&acc, e + 0x58, 4);
+            memcpy(&inr, e + 0x5C, 4); memcpy(&brk, e + 0x70, 4); memcpy(&bias, e + 0x74, 4); memcpy(&str, e + 0x78, 4);
+            memcpy(&fl, e + 0xA8, 4); memcpy(&n0, e + 0xB0, 4); memcpy(&n1, e + 0xB4, 4); memcpy(&n2, e + 0xB8, 4); memcpy(&n3, e + 0xBC, 4);
+            rep("0x%llX | %u | %g %g %g %g %g %g %g %g %g %g | %u %08X | %08X %08X %08X %08X\n",
+                (unsigned long long)(blks[b] + off), (unsigned)w0, (double)mass, (double)turn, (double)drag, (double)trac,
+                (double)acc, (double)inr, (double)spd, (double)brk, (double)bias, (double)str,
+                (unsigned)e[0x52], (unsigned)fl, (unsigned)n0, (unsigned)n1, (unsigned)n2, (unsigned)n3);
+        }
+        rep("  записей в блоке: %d\n", cnt);
+    }
+}
 /* PROBE_CORE_END */
 
 /* ── Windows-часть: чтение памяти, запрос, отчёт ── */
@@ -602,6 +644,7 @@ static void run_probe(uint64_t veh, uint64_t sub)
         if (veh) p_probe("veh", veh, 0x2000, 0x800, 64, 0x400, 6);
         if (sub) p_probe("sub", sub, 0x400, 0x10000, 64, 0x4000, 6);
         p_report();
+        p_enum();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         rep("\nИСКЛЮЧЕНИЕ внутри probe — отчёт неполный\n");
     }
@@ -634,6 +677,7 @@ static DWORD WINAPI probe_thread(LPVOID unused)
         buf[got] = 0;
         if (got < 6) continue;                 /* файл ещё дописывается — подождём следующего тика */
         DeleteFileW(req);
+        hook_log("probe: запрос получен: %s", buf);
         run_probe(parse_hex_key(buf, "veh="), parse_hex_key(buf, "sub="));
     }
     return 0;
