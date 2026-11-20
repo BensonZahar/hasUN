@@ -12,6 +12,7 @@
  *
  * /vtune probe (запрос от Lua-мода VTune) запускает поиск структуры хендлинга за указателями, отчёт — vtune_probe.txt
  * рядом с exe (только чтение памяти).
+ * /vtune tbl … — прямая правка таблицы хендлингов в памяти (см. блок TBL ниже), список записей — vtune_tbl.txt.
  *
  * Состояние хука пишется в %TEMP%\airbreak_hook.log (мод AirBreak перепечатает его в UE4SS.log).
  *
@@ -755,6 +756,239 @@ static unsigned long long parse_hex_key(const char *buf, const char *key)
     return strtoull(p + strlen(key), NULL, 16);
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * TBL: прямая правка таблицы хендлингов в памяти игры (команда /vtune tbl …).
+ * Запрос от Lua-мода: файл %TEMP%\vtune_tbl_req.txt, первая строка «sub=0x<адрес HandlingDataSubsystem>»,
+ * дальше команды (по одной в строке):
+ *   list                      записать ВСЕ записи таблицы в vtune_tbl.txt рядом с exe (id, счётчик ссылок, поля)
+ *   get <id>                  показать поля записи
+ *   set <id|a-b|all> <поле> <значение|xМножитель>    записать поле (speed, accel, mass, grip…)
+ *   reset                     вернуть всё, что меняли
+ *   refresh                   заново найти таблицу
+ * Ответы — строки «tbl: …» в airbreak_hook.log (мод VTune печатает их в UE4SS.log).
+ * Пишутся только float-поля записей таблицы; ничего больше в игре не трогается.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+typedef struct { const char *name; uint32_t off; } TblField;
+static const TblField TBL_F[] = {
+    { "mass", 0x04 }, { "turnmass", 0x0C }, { "drag", 0x10 }, { "traction", 0x38 }, { "grip", 0x38 },
+    { "accel", 0x58 }, { "inertia", 0x5C }, { "speed", 0x60 }, { "brake", 0x70 }, { "brakebias", 0x74 },
+    { "steer", 0x78 }, { "tloss", 0x7C }, { "tbias", 0x80 }, { "force", 0x84 }, { "damp", 0x88 },
+    { "hsdamp", 0x8C }, { "upper", 0x90 }, { "lower", 0x94 }, { "fr", 0x98 }, { "antidive", 0x9C },
+    { "seat", 0xA0 }, { "crash", 0xA4 },
+};
+#define TBL_NF ((int)(sizeof(TBL_F) / sizeof(TBL_F[0])))
+typedef struct { uint64_t addr; uint32_t old; } TblUndo;
+#define TBL_MAXUNDO 16384
+static TblUndo g_undo[TBL_MAXUNDO];
+static int g_nundo = 0;
+static uint64_t g_tbl_sub = 0;
+
+static const TblField *tbl_field(const char *s)
+{
+    int i;
+    for (i = 0; i < TBL_NF; i++) if (_stricmp(s, TBL_F[i].name) == 0) return &TBL_F[i];
+    return NULL;
+}
+
+static int tbl_refresh(uint64_t sub)
+{
+    g_pread = win_read;
+    g_replen = 0; g_nent = 0; g_npc = 0; g_pblocks = 0; g_pfail = 0; g_pptrs = 0;
+    __try {
+        p_probe("sub", sub, 0x400, 0x10000, 64, 0x4000, 6);
+        p_enum(0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hook_log("tbl: исключение при поиске таблицы");
+    }
+    g_tbl_sub = sub;
+    hook_log("tbl: таблица хендлингов: записей %d (подсистема 0x%llX)", g_nent, (unsigned long long)sub);
+    return g_nent;
+}
+
+static void tbl_write_file(const wchar_t *name, const char *buf, size_t len)
+{
+    wchar_t path[MAX_PATH + 32];
+    size_t n;
+    HANDLE h;
+    DWORD w = 0;
+    n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    while (n > 0 && path[n - 1] != L'\\' && path[n - 1] != L'/') n--;
+    path[n] = 0;
+    wcscat(path, name);
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { hook_log("tbl: не удалось создать файл (%lu)", GetLastError()); return; }
+    WriteFile(h, buf, (DWORD)len, &w, NULL);
+    CloseHandle(h);
+}
+
+static float tbl_getf(uint64_t addr, uint32_t off, int *ok)
+{
+    float f = 0.0f;
+    *ok = (g_pread(addr + off, &f, 4) == 4);
+    return f;
+}
+
+static void tbl_list(void)
+{
+    static char buf[400000];
+    size_t len = 0;
+    int i;
+    len += (size_t)snprintf(buf + len, sizeof(buf) - len,
+        "VTune tbl list: записей %d. Колонки: id | адрес записи | refs(счётчик shared-ссылок) | mass turnmass drag traction accel inertia speed brake steer\n", g_nent);
+    for (i = 0; i < g_nent && len + 300 < sizeof(buf); i++) {
+        PEnt *t = &g_ent[i];
+        uint32_t refs = 0;
+        int ok;
+        float m, tm, dr, tr, ac, in, sp, br, st;
+        g_pread(t->addr - 8, &refs, 4);
+        m = tbl_getf(t->addr, 0x04, &ok);  tm = tbl_getf(t->addr, 0x0C, &ok); dr = tbl_getf(t->addr, 0x10, &ok);
+        tr = tbl_getf(t->addr, 0x38, &ok); ac = tbl_getf(t->addr, 0x58, &ok); in = tbl_getf(t->addr, 0x5C, &ok);
+        sp = tbl_getf(t->addr, 0x60, &ok); br = tbl_getf(t->addr, 0x70, &ok); st = tbl_getf(t->addr, 0x78, &ok);
+        len += (size_t)snprintf(buf + len, sizeof(buf) - len, "%u | 0x%llX | %u | %g %g %g %g %g %g %g %g %g\n",
+            (unsigned)t->id, (unsigned long long)t->addr, (unsigned)refs,
+            (double)m, (double)tm, (double)dr, (double)tr, (double)ac, (double)in, (double)sp, (double)br, (double)st);
+    }
+    tbl_write_file(L"vtune_tbl.txt", buf, len);
+    hook_log("tbl: список записан в vtune_tbl.txt рядом с exe (%d записей)", g_nent);
+}
+
+static void tbl_get(uint32_t id)
+{
+    int i, n = 0, k;
+    for (i = 0; i < g_nent; i++) {
+        PEnt *t = &g_ent[i];
+        char line[500];
+        size_t len = 0;
+        if (t->id != id) continue;
+        n++;
+        len += (size_t)snprintf(line + len, sizeof(line) - len, "tbl: id %u @0x%llX:", (unsigned)id, (unsigned long long)t->addr);
+        for (k = 0; k < TBL_NF; k++) {
+            int ok;
+            float f;
+            if (k > 0 && TBL_F[k].off == TBL_F[k - 1].off) continue;   /* алиас grip */
+            f = tbl_getf(t->addr, TBL_F[k].off, &ok);
+            if (ok) len += (size_t)snprintf(line + len, sizeof(line) - len, " %s=%g", TBL_F[k].name, (double)f);
+        }
+        hook_log("%s", line);
+    }
+    if (!n) hook_log("tbl: записи с id %u нет", (unsigned)id);
+}
+
+/* who: «all», «N» или «A-B» */
+static void tbl_set(const char *who, const TblField *f, float val, int mul)
+{
+    unsigned long lo = 0, hi = 0xFFFFFFFFUL;
+    int i, changed = 0, bad = 0;
+    float first_old = 0.0f, first_new = 0.0f;
+    if (_stricmp(who, "all") != 0) {
+        char *end = NULL;
+        lo = strtoul(who, &end, 10);
+        hi = lo;
+        if (end && *end == '-') hi = strtoul(end + 1, NULL, 10);
+    }
+    for (i = 0; i < g_nent; i++) {
+        PEnt *t = &g_ent[i];
+        uint32_t w;
+        float cur, nv;
+        uint64_t a;
+        SIZE_T wr = 0;
+        if (t->id < lo || t->id > hi) continue;
+        a = t->addr + f->off;
+        if (g_pread(a, &w, 4) != 4) { bad++; continue; }
+        memcpy(&cur, &w, 4);
+        nv = mul ? cur * val : val;
+        if (!(nv == nv) || nv > 1e7f || nv < -1e7f) { bad++; continue; }
+        if (g_nundo >= TBL_MAXUNDO) { hook_log("tbl: слишком много правок — сделайте «reset»"); break; }
+        if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)(uintptr_t)a, &nv, 4, &wr) || wr != 4) { bad++; continue; }
+        g_undo[g_nundo].addr = a; g_undo[g_nundo].old = w; g_nundo++;
+        if (!changed) { first_old = cur; first_new = nv; }
+        changed++;
+    }
+    if (changed) hook_log("tbl: %s -> %s: записей изменено %d (первая: %g -> %g)%s", who, f->name, changed,
+                          (double)first_old, (double)first_new, bad ? ", с ошибками" : "");
+    else hook_log("tbl: ничего не изменено (нет записей для «%s» или запись не читается/не пишется, ошибок: %d)", who, bad);
+}
+
+static void tbl_reset(void)
+{
+    int i, n = 0;
+    for (i = g_nundo - 1; i >= 0; i--) {
+        SIZE_T wr = 0;
+        if (WriteProcessMemory(GetCurrentProcess(), (LPVOID)(uintptr_t)g_undo[i].addr, &g_undo[i].old, 4, &wr) && wr == 4) n++;
+    }
+    hook_log("tbl: возвращено значений: %d из %d", n, g_nundo);
+    g_nundo = 0;
+}
+
+static void tbl_exec(char *line)
+{
+    char *tok[6];
+    int n = 0;
+    char *p = line, *e;
+    while (*p && n < 6) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        tok[n++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = 0;
+    }
+    if (n == 0) return;
+    if (_stricmp(tok[0], "list") == 0) tbl_list();
+    else if (_stricmp(tok[0], "get") == 0 && n >= 2) tbl_get((uint32_t)strtoul(tok[1], NULL, 10));
+    else if (_stricmp(tok[0], "reset") == 0) tbl_reset();
+    else if (_stricmp(tok[0], "set") == 0 && n >= 4) {
+        const TblField *f = tbl_field(tok[2]);
+        int mul = 0;
+        char *v = tok[3];
+        float val;
+        if (!f) { hook_log("tbl: нет поля «%s»", tok[2]); return; }
+        if (*v == 'x' || *v == 'X' || *v == '*') { mul = 1; v++; }
+        for (e = v; *e; e++) if (*e == ',') *e = '.';
+        val = (float)strtod(v, &e);
+        if (e == v) { hook_log("tbl: значение «%s» не число", tok[3]); return; }
+        tbl_set(tok[1], f, val, mul);
+    }
+    else hook_log("tbl: неизвестная команда «%s» (list | get <id> | set <id|a-b|all> <поле> <знач|xN> | reset | refresh)", tok[0]);
+}
+
+static void tbl_poll(void)
+{
+    wchar_t req[MAX_PATH + 32];
+    HANDLE h;
+    char buf[2048];
+    DWORD got = 0;
+    char *line, *next;
+    uint64_t sub = 0;
+    int force = 0;
+    temp_path(L"vtune_tbl_req.txt", req, sizeof(req) / sizeof(req[0]));
+    if (GetFileAttributesW(req) == INVALID_FILE_ATTRIBUTES) return;
+    h = CreateFileW(req, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
+    CloseHandle(h);
+    buf[got] = 0;
+    if (got < 8 || buf[got - 1] != '\n') return;        /* файл ещё дописывается */
+    DeleteFileW(req);
+    for (line = buf; line && *line; line = next) {
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        { char *cr = strchr(line, '\r'); if (cr) *cr = 0; }
+        if (strncmp(line, "sub=", 4) == 0) { sub = strtoull(line + 4, NULL, 16); continue; }
+        if (_stricmp(line, "refresh") == 0) { force = 1; continue; }
+        if (!line[0]) continue;
+        if (g_nent == 0 || force || (sub && sub != g_tbl_sub)) {
+            if (!sub) { hook_log("tbl: нет адреса подсистемы"); return; }
+            if (tbl_refresh(sub) == 0) { hook_log("tbl: таблица не найдена"); return; }
+            force = 0;
+        }
+        __try { tbl_exec(line); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { hook_log("tbl: исключение при выполнении команды"); }
+    }
+    if (force && sub) tbl_refresh(sub);
+}
+
 static DWORD WINAPI probe_thread(LPVOID unused)
 {
     wchar_t req[MAX_PATH + 32];
@@ -766,6 +1000,7 @@ static DWORD WINAPI probe_thread(LPVOID unused)
         char buf[256];
         DWORD got = 0;
         Sleep(300);
+        tbl_poll();                            /* /vtune tbl … */
         if (GetFileAttributesW(req) == INVALID_FILE_ATTRIBUTES) continue;
         h = CreateFileW(req, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) continue;
