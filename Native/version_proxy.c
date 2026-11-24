@@ -108,6 +108,7 @@ static ChatRoute g_routes[] = {
     { L"air",   L"airbreak_chat.txt", { 0 } },
     { L"vtune", L"vtune_chat.txt",    { 0 } },
     { L"wtest", L"wtest_chat.txt",    { 0 } },
+    { L"vgun",  L"vgun_chat.txt",     { 0 } },
 };
 #define NROUTES ((int)(sizeof(g_routes) / sizeof(g_routes[0])))
 
@@ -1036,7 +1037,7 @@ static DWORD WINAPI install_thread(LPVOID unused)
     }
     temp_path(L"airbreak_hook.log", logp, sizeof(logp) / sizeof(logp[0]));
     DeleteFileW(logp);
-    hook_log("version.dll (AirBreak) загружена, ищу SendChatInput (команды: /air, /vtune, /wtest)");
+    hook_log("version.dll (AirBreak) загружена, ищу SendChatInput (команды: /air, /vtune, /wtest, /vgun)");
     if (g_cmdline) hook_log("командная строка с аргументами: %ls", g_cmdline);
     else hook_log("аргументы запуска не подменены (GetCommandLineW не найден в импорте exe)");
     for (i = 0; i < 90; i++) {
